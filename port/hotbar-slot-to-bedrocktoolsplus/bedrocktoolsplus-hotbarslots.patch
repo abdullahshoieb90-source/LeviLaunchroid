@@ -1,0 +1,813 @@
+diff --git a/README.md b/README.md
+index 2d6bdf8..df2f510 100644
+--- a/README.md
++++ b/README.md
+@@ -9,7 +9,7 @@ The source is public so people can study how a real LeviLauncher mod is structur
+ ## Features
+ 
+ - Native C++20 mod built for LeviLauncher and Preloader
+-- 53 configurable modules
++- 54 configurable modules
+ - Public headers for Minecraft wrappers, offsets, signatures, and utilities
+ - Typed event system with runtime subscriptions for other native mods
+ - LeviLauncher mod-menu integration and persistent configuration
+diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
+index f0b218b..1456b34 100755
+--- a/scripts/run_tests.sh
++++ b/scripts/run_tests.sh
+@@ -68,6 +68,12 @@ for source in "${root}"/tests/*_test.cpp; do
+         externalbuttonrefresh_test)
+             extra+=(-I "${root}/tests/fakejni")
+             ;;
++        hotbarslots_test)
++            # Builds the real module as a second translation unit against the
++            # host fakes; no xmake packages needed.
++            extra+=(-I "${root}/tests/fakepl" -I "${root}/tests/fakejson")
++            extra_srcs+=("${root}/src/modules/hud/hotbarslots.cpp")
++            ;;
+         customcapes_patch_test|wings_patch_test)
+             # Builds the real module as a second translation unit; the
+             # preloader/nlohmann_json headers it includes come from the
+diff --git a/src/launcher/ModuleMenu.cpp b/src/launcher/ModuleMenu.cpp
+index 837724c..3604353 100644
+--- a/src/launcher/ModuleMenu.cpp
++++ b/src/launcher/ModuleMenu.cpp
+@@ -98,7 +98,8 @@ static void onModuleConfigChanged(std::string_view module_id, std::string_view k
+     mod->loadConfig(j);
+ 
+     if (module_id == "bedrocktoolsplus.CommentKey" ||
+-        module_id == "bedrocktoolsplus.Command Hotkey") {
++        module_id == "bedrocktoolsplus.Command Hotkey" ||
++        module_id == "bedrocktoolsplus.Hotbar Slots") {
+         // Refresh the Java view in place. It replaces the button definition
+         // and reapplies its label without hiding the overlay.
+         bedrocktools::launcher::refreshExternalButtonsForModule(module_id);
+diff --git a/src/modules/ModuleRegistry.cpp b/src/modules/ModuleRegistry.cpp
+index 3b94195..4981f7a 100644
+--- a/src/modules/ModuleRegistry.cpp
++++ b/src/modules/ModuleRegistry.cpp
+@@ -51,6 +51,7 @@
+ #include <bedrocktools/modules/visual/wings.hpp>
+ #include "player/autosprint.hpp"
+ #include "hud/armorhud.hpp"
++#include "hud/hotbarslots.hpp"
+ 
+ 
+ ModuleRegistry& ModuleRegistry::get() {
+@@ -158,4 +159,5 @@ void registerAllModules() {
+     registry.emplace<AutoSprintModule>();
+     registry.emplace<CustomCapesModule>();
+     registry.emplace<ArmorHudModule>();
++    registry.emplace<HotbarSlotsModule>();
+ }
+diff --git a/src/modules/hud/hotbarslots.cpp b/src/modules/hud/hotbarslots.cpp
+new file mode 100644
+index 0000000..408295b
+--- /dev/null
++++ b/src/modules/hud/hotbarslots.cpp
+@@ -0,0 +1,337 @@
++#include "hotbarslots.hpp"
++
++#include "core/GameHooks.hpp"
++#include "launcher/ExternalButtonRefresh.hpp"
++
++#include <bedrocktools/sdk/Offsets.hpp>
++#include <pl/ModMenu.hpp>
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <utility>
++
++#if defined(__ANDROID__)
++#include <jni.h>
++#endif
++
++namespace {
++
++HotbarSlotsModule* g_instance = nullptr;
++
++// Same base the Command Hotkey module uses: LeviLauncher derives an
++// independent persisted HUD position from each stable button ID.
++constexpr float kLauncherButtonBaseSize = 52.0f;
++
++constexpr std::uint32_t kDefaultTextColor = 0xFF373737u;
++constexpr std::uint32_t kActiveTextColor = 0xFF1F1F1Fu;
++// Occupied-slot highlight, mirroring the light pressed number LeviLaunchroid
++// draws on its hotbar buttons.
++constexpr std::uint32_t kOccupiedTextColor = 0xFFFFFFFFu;
++
++// Minecraft-style square frame shared with the Zoom / Command Hotkey overlay
++// buttons; the launcher draws the slot number on top as the button label.
++const char* slotButtonSvg = R"svg(<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
++    <path fill="#C6C6C6" stroke="#373737" stroke-width="2" d="M2,2 L62,2 L62,62 L2,62 Z M4,4 L60,4 L60,60 L4,60 Z"/>
++    <path fill="#8B8B8B" stroke="#5B5B5B" stroke-width="2" d="M6,6 L58,6 L58,58 L6,58 Z M8,8 L56,8 L56,56 L8,56 Z"/>
++</svg>)svg";
++
++const char* slotButtonActiveSvg = R"svg(<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
++    <path fill="#C6C6C6" stroke="#373737" stroke-width="2" d="M2,2 L62,2 L62,62 L2,62 Z M4,4 L60,4 L60,60 L4,60 Z"/>
++    <g transform="translate(32, 32) scale(0.85) translate(-32, -32)">
++        <path fill="#8B8B8B" stroke="#5B5B5B" stroke-width="2" d="M6,6 L58,6 L58,58 L6,58 Z M8,8 L56,8 L56,56 L8,56 Z"/>
++    </g>
++</svg>)svg";
++
++std::string slotKey(int slot, const char* suffix) {
++    return "m_slot" + std::to_string(slot) + suffix;
++}
++
++} // namespace
++
++HotbarSlotsModule::HotbarSlotsModule()
++    : Module("Hotbar Slots", "On-screen 1-9 buttons for selecting hotbar slots, with optional item awareness.") {
++    g_instance = this;
++    // On-screen slots are launcher overlay buttons. The parent module has no
++    // custom draw surface of its own in the HUD editor.
++    hideInHudEditor = true;
++}
++
++HotbarSlotsModule::~HotbarSlotsModule() {
++    unregisterOverlayButtons();
++    if (g_instance == this) g_instance = nullptr;
++}
++
++HotbarSlotsModule* HotbarSlotsModule::instance() {
++    return g_instance;
++}
++
++std::string HotbarSlotsModule::slotButtonId(int slot) {
++    // No spaces: the launcher persists per-button HUD positions keyed by ID.
++    return "bedrocktoolsplus.HotbarSlots.Button" + std::to_string(slot);
++}
++
++void HotbarSlotsModule::onInit() {
++    // The launcher owns each on-screen button and its independent HUD-editor
++    // position; input hooks are installed once by Runtime.
++    syncOverlayButtons();
++}
++
++void HotbarSlotsModule::onEnable() {
++    syncOverlayButtons();
++}
++
++void HotbarSlotsModule::onDisable() {
++    flushPendingKeyUp();
++}
++
++void HotbarSlotsModule::selectSlot(int slot) {
++    if (!enabled || slot < 1 || slot > SlotCount) return;
++    if (!m_slots[static_cast<std::size_t>(slot - 1)].enabled) return;
++    // A tap only spans one launcher click event, so hold the key down and let
++    // the next frame release it. That keeps the key visible to the game's
++    // input poll for at least one tick (press-and-hold parity with
++    // HotbarSlotOverlay, which sends down on press-start and up on press-end).
++    flushPendingKeyUp();
++    // Bedrock key codes '1'..'9', exactly what HotbarSlotOverlay.sendSlotKey
++    // passes to MoreButtonsMod.sendKey.
++    if (platformSendKey('0' + slot, true)) m_pendingKeyUpSlot = slot;
++}
++
++void HotbarSlotsModule::flushPendingKeyUp() {
++    if (m_pendingKeyUpSlot <= 0) return;
++    const int slot = m_pendingKeyUpSlot;
++    m_pendingKeyUpSlot = 0;
++    platformSendKey('0' + slot, false);
++}
++
++void* HotbarSlotsModule::localPlayer() {
++    void* client = bedrocktools::core::gamehooks::clientInstance();
++    if (!client) return nullptr;
++    void** vtable = *reinterpret_cast<void***>(client);
++    if (!vtable) return nullptr;
++    auto getPlayer = reinterpret_cast<void* (*)(void*)>(
++        vtable[bedrocktools::sdk::offsets::VTable::ClientInstanceGetLocalPlayer]);
++    if (!getPlayer) return nullptr;
++    return getPlayer(client);
++}
++
++bool HotbarSlotsModule::hotbarHasItem(const void* player, int slot) {
++    using namespace bedrocktools::sdk::offsets::Inventory;
++    if (!player || slot < 0 || slot >= SlotCount) return false;
++    const auto* bytes = static_cast<const std::byte*>(player);
++    const void* proxy = *reinterpret_cast<const void* const*>(bytes + PlayerInventory);
++    if (!proxy) return false;
++    const void* inventory = *reinterpret_cast<const void* const*>(
++        static_cast<const std::byte*>(proxy) + PlayerInventoryContainer);
++    if (!inventory) return false;
++    // Hotbar occupies the first SlotCount entries of the player inventory
++    // container (slots 0..8), matching the `slot - 1` indexing HotbarSlotMod
++    // uses on the Java side.
++    const auto* items = static_cast<const std::byte*>(inventory) + FillingContainerItems;
++    const std::uintptr_t begin = *reinterpret_cast<const std::uintptr_t*>(items);
++    const std::uintptr_t end = *reinterpret_cast<const std::uintptr_t*>(items + sizeof(void*));
++    if (!begin || end < begin) return false;
++    const std::size_t count = (end - begin) / ItemStackSize;
++    if (static_cast<std::size_t>(slot) >= count) return false;
++    const std::byte* stack =
++        reinterpret_cast<const std::byte*>(begin) + static_cast<std::size_t>(slot) * ItemStackSize;
++    if (!*reinterpret_cast<const std::uint8_t*>(stack + ItemStackValid)) return false;
++    return *reinterpret_cast<const std::uint8_t*>(stack + ItemStackCount) != 0;
++}
++
++void HotbarSlotsModule::onFrame() {
++    flushPendingKeyUp();
++    if (!m_itemIcons) return;
++    void* player = localPlayer();
++    bool changed = false;
++    for (int i = 0; i < SlotCount; ++i) {
++        const bool occupied = player && m_slots[static_cast<std::size_t>(i)].enabled
++            ? hotbarHasItem(player, i)
++            : false;
++        if (occupied != m_occupied[static_cast<std::size_t>(i)]) {
++            m_occupied[static_cast<std::size_t>(i)] = occupied;
++            changed = true;
++        }
++    }
++    // Same refresh contract as Command Hotkey: re-register the native button
++    // definitions so the launcher snapshot picks up the new colors, then ask
++    // the launcher to re-apply them in place (needs the ModuleMenu entry for
++    // this module ID).
++    if (changed) {
++        syncOverlayButtons();
++        bedrocktools::launcher::refreshExternalButtonsForModule(moduleId);
++    }
++}
++
++std::vector<HotbarSlotsModule::SlotButtonDef> HotbarSlotsModule::buildButtonDefs() const {
++    std::vector<SlotButtonDef> defs;
++    for (int i = 0; i < SlotCount; ++i) {
++        const auto& cfg = m_slots[static_cast<std::size_t>(i)];
++        if (!cfg.enabled) continue;
++        SlotButtonDef def;
++        def.slot = i + 1;
++        def.id = slotButtonId(def.slot);
++        def.label = std::to_string(def.slot);
++        const float sizeDp = std::clamp(cfg.sizeDp, MinSizeDp, MaxSizeDp);
++        const float scale = (sizeDp / kLauncherButtonBaseSize) * m_buttonScale;
++        def.scaleX = scale;
++        def.scaleY = scale;
++        const bool occupied = m_itemIcons && m_occupied[static_cast<std::size_t>(i)];
++        def.occupied = occupied;
++        def.textColor = occupied ? kOccupiedTextColor : kDefaultTextColor;
++        def.activeTextColor = kActiveTextColor;
++        defs.push_back(std::move(def));
++    }
++    return defs;
++}
++
++void HotbarSlotsModule::unregisterOverlayButtons() {
++    for (int slot = 1; slot <= SlotCount; ++slot)
++        pl::modmenu::unregisterButton(slotButtonId(slot));
++}
++
++void HotbarSlotsModule::syncOverlayButtons() {
++    // Registering a duplicate button id is rejected, so unregister first
++    // (same pattern as CommandHotkeyModule::syncOverlayButtons).
++    unregisterOverlayButtons();
++    for (const auto& def : buildButtonDefs()) {
++        const int slot = def.slot;
++        pl::modmenu::ButtonBuilder builder(def.id, "Hotbar " + std::to_string(slot));
++        builder.moduleId(moduleId)
++            .label(def.label)
++            .behavior(pl::modmenu::ButtonBehavior::Click)
++            .defaultVisible(true)
++            .stylePreset(pl::modmenu::ButtonStylePreset::Accent)
++            .styleColors(0x00000001, 0x00000001, 0x00000001)
++            .svgIcon(slotButtonSvg, false)
++            .activeSvgIcon(slotButtonActiveSvg)
++            .textColor(def.textColor)
++            .activeTextColor(def.activeTextColor)
++            .sizeScale(def.scaleX, def.scaleY)
++            .onEvent([this, slot](std::string_view, pl::modmenu::ButtonEvent event, float) {
++                if (event == pl::modmenu::ButtonEvent::Click) selectSlot(slot);
++            });
++        (void)builder.registerButton();
++    }
++}
++
++bool HotbarSlotsModule::platformSendKey(int bedrockCode, bool down) {
++#if defined(__ANDROID__)
++    // Same call HotbarSlotOverlay.sendSlotKey makes: MoreButtonsMod.sendKey
++    // validates 0 < keyCode < 256 and loads libinbuiltmods itself, so no
++    // explicit initialize() is needed here.
++    if (bedrockCode <= 0 || bedrockCode >= 256) return false;
++    auto* vm = reinterpret_cast<JavaVM*>(bedrocktools::launcher::javaVm());
++    if (!vm) return false;
++    JNIEnv* env = nullptr;
++    const bool detached = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_EDETACHED;
++    if (detached && (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env)) return false;
++    if (!env) {
++        if (detached) vm->DetachCurrentThread();
++        return false;
++    }
++    bool ok = false;
++    jclass cls = env->FindClass("org/levimc/launcher/core/mods/inbuilt/nativemod/MoreButtonsMod");
++    if (cls && !env->ExceptionCheck()) {
++        jmethodID sendKey = env->GetStaticMethodID(cls, "sendKey", "(IZ)Z");
++        if (sendKey && !env->ExceptionCheck()) {
++            ok = env->CallStaticBooleanMethod(cls, sendKey, static_cast<jint>(bedrockCode),
++                                              static_cast<jboolean>(down ? JNI_TRUE : JNI_FALSE)) == JNI_TRUE;
++        }
++    }
++    if (env->ExceptionCheck()) {
++        env->ExceptionClear();
++        ok = false;
++    }
++    if (cls) env->DeleteLocalRef(cls);
++    if (detached) vm->DetachCurrentThread();
++    return ok;
++#else
++    (void)bedrockCode;
++    (void)down;
++    return false;
++#endif
++}
++
++// Config readers that compile against both the real nlohmann_json headers and
++// the host fake in tests/fakejson (which only provides contains / get<T> /
++// is_boolean / is_string). Non-numeric values fall back to the default instead
++// of throwing.
++namespace {
++
++bool jsonBool(const nlohmann::json& j, const std::string& key, bool fallback) {
++    try {
++        if (!j.contains(key) || !j[key].is_boolean()) return fallback;
++        return j[key].get<bool>();
++    } catch (...) {
++        return fallback;
++    }
++}
++
++float jsonFloat(const nlohmann::json& j, const std::string& key, float fallback, float lo, float hi) {
++    try {
++        if (!j.contains(key)) return fallback;
++        const auto& v = j[key];
++        if (v.is_boolean() || v.is_string()) return fallback;
++        return std::clamp(v.get<float>(), lo, hi);
++    } catch (...) {
++        return fallback;
++    }
++}
++
++} // namespace
++
++void HotbarSlotsModule::loadConfig(const nlohmann::json& j) {
++    const auto previousDefs = buildButtonDefs();
++    const float previousScale = m_buttonScale;
++    const bool previousIcons = m_itemIcons;
++    Module::loadConfig(j);
++
++    m_itemIcons = jsonBool(j, "m_itemIcons", m_itemIcons);
++    m_buttonScale = jsonFloat(j, "m_buttonScale", m_buttonScale, 0.5f, 2.0f);
++    m_buttonOpacity = jsonFloat(j, "m_buttonOpacity", m_buttonOpacity, 0.05f, 1.0f);
++
++    for (int slot = 1; slot <= SlotCount; ++slot) {
++        auto& cfg = m_slots[static_cast<std::size_t>(slot - 1)];
++        cfg.enabled = jsonBool(j, slotKey(slot, ""), cfg.enabled);
++        cfg.sizeDp = jsonFloat(j, slotKey(slot, "Size"), cfg.sizeDp, MinSizeDp, MaxSizeDp);
++        cfg.opacity = jsonFloat(j, slotKey(slot, "Opacity"), cfg.opacity, 0.0f, 1.0f);
++    }
++
++    // NOTE: per-slot opacity is persisted for forward compatibility (same as
++    // CommandHotkeyModule::m_buttonOpacity): the current ButtonBuilder API
++    // exposes size but no opacity setter, so opacity stays launcher-managed
++    // until the API grows one.
++
++    if (!m_itemIcons) m_occupied.fill(false);
++
++    // Re-register the native button definitions whenever anything shown on a
++    // button changed (visibility, size, scale, icon highlight). The launcher
++    // keeps its own snapshot of each ExternalButton, so the native definition
++    // must be refreshed before refreshExternalButtonsForModule re-applies it
++    // to the visible overlay.
++    const bool overlayChanged =
++        previousScale != m_buttonScale || previousIcons != m_itemIcons || previousDefs.size() != buildButtonDefs().size() ||
++        !std::equal(previousDefs.begin(), previousDefs.end(), buildButtonDefs().begin(), buildButtonDefs().end(),
++                    [](const SlotButtonDef& a, const SlotButtonDef& b) {
++                        return a.id == b.id && a.label == b.label && a.scaleX == b.scaleX &&
++                            a.scaleY == b.scaleY && a.textColor == b.textColor;
++                    });
++    if (overlayChanged) syncOverlayButtons();
++}
++
++void HotbarSlotsModule::saveConfig(nlohmann::json& j) {
++    Module::saveConfig(j);
++    j["m_itemIcons"] = m_itemIcons;
++    j["m_buttonScale"] = m_buttonScale;
++    j["m_buttonOpacity"] = m_buttonOpacity;
++    for (int slot = 1; slot <= SlotCount; ++slot) {
++        const auto& cfg = m_slots[static_cast<std::size_t>(slot - 1)];
++        j[slotKey(slot, "")] = cfg.enabled;
++        j[slotKey(slot, "Size")] = cfg.sizeDp;
++        j[slotKey(slot, "Opacity")] = cfg.opacity;
++    }
++}
+diff --git a/src/modules/hud/hotbarslots.hpp b/src/modules/hud/hotbarslots.hpp
+new file mode 100644
+index 0000000..af05f7f
+--- /dev/null
++++ b/src/modules/hud/hotbarslots.hpp
+@@ -0,0 +1,104 @@
++#pragma once
++
++#include "../Module.hpp"
++
++#include <array>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++// Hotbar Slots: on-screen 1-9 buttons for selecting hotbar slots.
++//
++// Native port of the LeviLauncher "Hotbar Slot" inbuilt mod (see
++// HotbarSlotOverlay / HotbarSlotMod in LeviLaunchroid). Each visible slot is a
++// launcher overlay button; pressing one selects the matching hotbar slot
++// through the same key path the launcher overlay uses (MoreButtonsMod.sendKey
++// with '1'..'9' down/up).
++//
++// Mapping from the LeviLaunchroid original:
++//   HotbarSlotOverlay (per-slot button 1..9) -> overlay buttons registered in
++//     syncOverlayButtons(), one pl::modmenu::ButtonBuilder per visible slot.
++//   InbuiltModManager hotbar_slot_enabled_N   -> m_slots[N].enabled
++//     (menu toggles m_slot1..m_slot9).
++//   Per-slot size/opacity                    -> m_slots[N].sizeDp / opacity
++//     (menu sliders m_slotNSize / m_slotNOpacity nested under m_slotN).
++//   hotbar_item_icons + HotbarSlotMod.hasItem -> m_itemIcons +
++//     hotbarHasItem(), read straight from the player inventory memory with the
++//     same offsets InventoryAccess uses. Occupied slots are highlighted;
++//     rendering true item icons onto the buttons (like ArmorHudModule does for
++//     armor) is left as future work.
++// (Not marked final so host tests can subclass it with a recording key
++// sender; production behavior is unchanged.)
++class HotbarSlotsModule : public Module {
++public:
++    static constexpr int SlotCount = 9;
++    static constexpr float DefaultSizeDp = 56.0f;
++    static constexpr float MinSizeDp = 20.0f;
++    static constexpr float MaxSizeDp = 100.0f;
++
++    struct SlotButtonDef {
++        int slot = 1; // 1..9
++        std::string id;
++        std::string label;
++        float scaleX = 1.0f;
++        float scaleY = 1.0f;
++        std::uint32_t textColor = 0xFF373737u;
++        std::uint32_t activeTextColor = 0xFF1F1F1Fu;
++        bool occupied = false; // last hotbarHasItem() poll result
++    };
++
++    HotbarSlotsModule();
++    ~HotbarSlotsModule() override;
++
++    void onInit() override;
++    void onEnable() override;
++    void onDisable() override;
++    void onFrame() override;
++
++    void loadConfig(const nlohmann::json& j) override;
++    void saveConfig(nlohmann::json& j) override;
++
++    // Selects a hotbar slot (1..9). Shared entry point for the overlay-button
++    // callback and host tests.
++    void selectSlot(int slot);
++
++    static HotbarSlotsModule* instance();
++
++    // Overlay definitions for the currently visible slots. Pure function of
++    // the config + last occupancy poll, so host tests can verify it without a
++    // launcher.
++    std::vector<SlotButtonDef> buildButtonDefs() const;
++
++    // True when hotbar slot `slot` (0-based, matching the `slot - 1`
++    // convention HotbarSlotMod uses) holds at least one item. Reads the
++    // player inventory container directly, mirroring InventoryAccess. Public
++    // so host tests can exercise it with a crafted buffer.
++    static bool hotbarHasItem(const void* player, int slot);
++
++protected:
++    // Platform seam: feeds one Bedrock key code down/up into the game. The
++    // production path is JNI into the launcher's MoreButtonsMod (the exact
++    // call HotbarSlotOverlay.sendSlotKey makes); host tests override it to
++    // record calls.
++    virtual bool platformSendKey(int bedrockCode, bool down);
++
++private:
++    struct SlotConfig {
++        bool enabled = true;
++        float sizeDp = DefaultSizeDp;
++        float opacity = 1.0f;
++    };
++
++    static std::string slotButtonId(int slot);
++    void syncOverlayButtons();
++    void unregisterOverlayButtons();
++    void flushPendingKeyUp();
++    static void* localPlayer();
++
++    bool m_itemIcons = false;
++    float m_buttonScale = 1.0f;
++    float m_buttonOpacity = 0.85f;
++    std::array<SlotConfig, SlotCount> m_slots{};
++    std::array<bool, SlotCount> m_occupied{};
++    int m_pendingKeyUpSlot = 0; // 1..9, 0 = none
++};
+diff --git a/tests/hotbarslots_test.cpp b/tests/hotbarslots_test.cpp
+new file mode 100644
+index 0000000..0c40503
+--- /dev/null
++++ b/tests/hotbarslots_test.cpp
+@@ -0,0 +1,292 @@
++// Unit tests for the Hotbar Slots module (native port of LeviLauncher's
++// "Hotbar Slot" inbuilt mod).
++//
++// Covers the parts that are plain C++ and need no game or launcher:
++//   * default button definitions (9 slots, labels 1..9, stable IDs, scaling)
++//   * per-slot enable/size config mapping
++//   * config save/load round-trip
++//   * press flow: selectSlot() sends key-down, the next onFrame() sends key-up
++//   * hotbarHasItem() against a crafted player-inventory buffer
++//   * item-icons highlight + overlay refresh on occupancy change
++//
++// Build and run standalone (no xmake packages needed):
++//
++//     g++ -std=c++20 -I src -I include -I tests/fakepl -I tests/fakejson
++//         tests/hotbarslots_test.cpp src/modules/hud/hotbarslots.cpp
++//         -o /tmp/hotbarslots_test
++//     /tmp/hotbarslots_test
++//
++// The overlay-button registration itself (pl::modmenu::ButtonBuilder) is only
++// exercised through the host fake, which discards handlers; production wiring
++// follows the Command Hotkey / Zoom modules one-to-one.
++
++#include "modules/hud/hotbarslots.hpp"
++
++#include <bedrocktools/sdk/Offsets.hpp>
++
++#include <cassert>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <vector>
++
++// ---------------------------------------------------------------------------
++// Core / launcher stubs (host has no game process or launcher VM).
++// ---------------------------------------------------------------------------
++
++namespace {
++
++void* g_client = nullptr;
++int g_refreshCount = 0;
++
++void* fakeLocalPlayer = nullptr;
++
++void* stubGetLocalPlayer(void*) {
++    return fakeLocalPlayer;
++}
++
++} // namespace
++
++namespace bedrocktools::core::gamehooks {
++
++void* clientInstance() {
++    return g_client;
++}
++
++} // namespace bedrocktools::core::gamehooks
++
++namespace bedrocktools::launcher {
++
++void* javaVm() {
++    return nullptr;
++}
++
++void refreshExternalButtonsForModule(std::string_view) {
++    ++g_refreshCount;
++}
++
++} // namespace bedrocktools::launcher
++
++// ---------------------------------------------------------------------------
++// Test module with a recording key sender.
++// ---------------------------------------------------------------------------
++
++class TestHotbar : public HotbarSlotsModule {
++public:
++    struct KeyCall {
++        int code = 0;
++        bool down = false;
++    };
++
++    std::vector<KeyCall> keys;
++
++protected:
++    bool platformSendKey(int code, bool down) override {
++        keys.push_back(KeyCall{code, down});
++        return true;
++    }
++};
++
++// ---------------------------------------------------------------------------
++// Crafted player-inventory buffer for hotbarHasItem().
++// ---------------------------------------------------------------------------
++
++namespace {
++
++using namespace bedrocktools::sdk::offsets::Inventory;
++
++struct FakeInventory {
++    std::vector<std::byte> player{0x600, std::byte{0}};
++    std::vector<std::byte> proxy{0x200, std::byte{0}};
++    std::vector<std::byte> container{0x200, std::byte{0}};
++    std::vector<std::byte> items;
++
++    explicit FakeInventory(std::size_t slots = 36) : items(slots * ItemStackSize, std::byte{0}) {
++        *reinterpret_cast<void**>(player.data() + PlayerInventory) = proxy.data();
++        *reinterpret_cast<void**>(proxy.data() + PlayerInventoryContainer) = container.data();
++        *reinterpret_cast<std::uintptr_t*>(container.data() + FillingContainerItems) =
++            reinterpret_cast<std::uintptr_t>(items.data());
++        *reinterpret_cast<std::uintptr_t*>(container.data() + FillingContainerItems + sizeof(void*)) =
++            reinterpret_cast<std::uintptr_t>(items.data() + items.size());
++    }
++
++    void setStack(std::size_t slot, bool valid, std::uint8_t count) {
++        std::byte* stack = items.data() + slot * ItemStackSize;
++        *reinterpret_cast<std::uint8_t*>(stack + ItemStackValid) = valid ? 1 : 0;
++        *reinterpret_cast<std::uint8_t*>(stack + ItemStackCount) = count;
++    }
++
++    const void* playerPtr() const {
++        return player.data();
++    }
++};
++
++int failures = 0;
++
++void check(bool cond, const char* name) {
++    if (cond) {
++        std::printf("  ok: %s\n", name);
++    } else {
++        std::printf("  FAIL: %s\n", name);
++        ++failures;
++    }
++}
++
++} // namespace
++
++int main() {
++    // ---- defaults ----
++    {
++        TestHotbar mod;
++        auto defs = mod.buildButtonDefs();
++        check(defs.size() == 9, "nine buttons by default");
++        bool labelsOk = true;
++        bool idsOk = true;
++        for (std::size_t i = 0; i < defs.size(); ++i) {
++            labelsOk &= defs[i].slot == static_cast<int>(i + 1) &&
++                defs[i].label == std::to_string(i + 1);
++            idsOk &= defs[i].id ==
++                "bedrocktoolsplus.HotbarSlots.Button" + std::to_string(i + 1);
++        }
++        check(labelsOk, "labels are 1..9 in order");
++        check(idsOk, "stable button IDs");
++        const float expected = 56.0f / 52.0f;
++        bool scaleOk = true;
++        for (const auto& d : defs) scaleOk &= d.scaleX == expected && d.scaleY == expected;
++        check(scaleOk, "default scale is 56dp / 52 base");
++    }
++
++    // ---- per-slot config ----
++    {
++        TestHotbar mod;
++        nlohmann::json j;
++        j["m_slot5"] = false;
++        j["m_slot3Size"] = 100.0f;
++        j["m_buttonScale"] = 0.5f;
++        mod.loadConfig(j);
++        auto defs = mod.buildButtonDefs();
++        check(defs.size() == 8, "disabled slot disappears");
++        bool noFive = true;
++        bool threeScaled = false;
++        for (const auto& d : defs) {
++            noFive &= d.slot != 5;
++            if (d.slot == 3) threeScaled = d.scaleX == (100.0f / 52.0f) * 0.5f;
++        }
++        check(noFive, "slot 5 gone");
++        check(threeScaled, "per-slot size times global scale");
++    }
++
++    // ---- save/load round-trip ----
++    {
++        TestHotbar a;
++        nlohmann::json j;
++        j["m_itemIcons"] = true;
++        j["m_slot1"] = false;
++        j["m_slot9Size"] = 20.0f;
++        j["m_slot2Opacity"] = 0.25f;
++        a.loadConfig(j);
++        nlohmann::json saved;
++        a.saveConfig(saved);
++        TestHotbar b;
++        b.loadConfig(saved);
++        auto da = a.buildButtonDefs();
++        auto db = b.buildButtonDefs();
++        bool same = da.size() == db.size();
++        for (std::size_t i = 0; same && i < da.size(); ++i) {
++            same = da[i].id == db[i].id && da[i].label == db[i].label &&
++                da[i].scaleX == db[i].scaleX && da[i].textColor == db[i].textColor;
++        }
++        check(same, "config round-trip preserves buttons");
++        check(saved["m_itemIcons"].get<bool>(), "itemIcons persisted");
++        check(saved["m_slot2Opacity"].get<float>() == 0.25f, "per-slot opacity persisted");
++    }
++
++    // ---- press flow: down on select, up on next frame ----
++    {
++        TestHotbar mod;
++        mod.setMasterEnabled(true);
++        mod.selectSlot(3);
++        check(mod.keys.size() == 1 && mod.keys[0].code == '0' + 3 && mod.keys[0].down,
++              "select sends key-down '3'");
++        mod.onFrame();
++        check(mod.keys.size() == 2 && mod.keys[1].code == '0' + 3 && !mod.keys[1].down,
++              "next frame sends key-up");
++        mod.onFrame();
++        check(mod.keys.size() == 2, "no repeat key-up");
++    }
++
++    // ---- press guards ----
++    {
++        TestHotbar mod;
++        mod.selectSlot(1);
++        check(mod.keys.empty(), "no keys while module disabled");
++        mod.setMasterEnabled(true);
++        mod.selectSlot(0);
++        mod.selectSlot(10);
++        check(mod.keys.empty(), "out-of-range slots ignored");
++        nlohmann::json j;
++        j["m_slot4"] = false;
++        mod.loadConfig(j);
++        mod.selectSlot(4);
++        check(mod.keys.empty(), "disabled slot ignored");
++    }
++
++    // ---- hotbarHasItem against a crafted buffer ----
++    {
++        FakeInventory inv;
++        inv.setStack(0, true, 3);
++        inv.setStack(1, false, 5);
++        inv.setStack(2, true, 0);
++        check(HotbarSlotsModule::hotbarHasItem(inv.playerPtr(), 0), "occupied slot detected");
++        check(!HotbarSlotsModule::hotbarHasItem(inv.playerPtr(), 1), "invalid stack empty");
++        check(!HotbarSlotsModule::hotbarHasItem(inv.playerPtr(), 2), "zero-count stack empty");
++        check(!HotbarSlotsModule::hotbarHasItem(inv.playerPtr(), 8), "untouched slot empty");
++        check(!HotbarSlotsModule::hotbarHasItem(inv.playerPtr(), 9), "slot 9 out of hotbar");
++        check(!HotbarSlotsModule::hotbarHasItem(inv.playerPtr(), -1), "negative slot rejected");
++        check(!HotbarSlotsModule::hotbarHasItem(nullptr, 0), "null player rejected");
++    }
++
++    // ---- item-icons highlight + refresh on occupancy change ----
++    {
++        FakeInventory inv;
++        inv.setStack(0, true, 1);
++
++        static void* vtable[64] = {};
++        vtable[bedrocktools::sdk::offsets::VTable::ClientInstanceGetLocalPlayer] =
++            reinterpret_cast<void*>(&stubGetLocalPlayer);
++        alignas(void*) unsigned char clientBlock[2 * sizeof(void*)] = {};
++        *reinterpret_cast<void**>(clientBlock) = static_cast<void*>(vtable);
++        g_client = static_cast<void*>(clientBlock);
++        fakeLocalPlayer = const_cast<void*>(inv.playerPtr());
++
++        TestHotbar mod;
++        mod.setMasterEnabled(true);
++        nlohmann::json j;
++        j["m_itemIcons"] = true;
++        mod.loadConfig(j);
++
++        const int before = g_refreshCount;
++        mod.onFrame();
++        check(g_refreshCount == before + 1, "occupancy change refreshes overlay");
++        auto defs = mod.buildButtonDefs();
++        bool highlighted = false;
++        for (const auto& d : defs) {
++            if (d.slot == 1) highlighted = d.occupied && d.textColor == 0xFFFFFFFFu;
++        }
++        check(highlighted, "occupied slot highlighted");
++        const int settled = g_refreshCount;
++        mod.onFrame();
++        check(g_refreshCount == settled, "steady state does not churn");
++
++        g_client = nullptr;
++        fakeLocalPlayer = nullptr;
++    }
++
++    if (failures == 0) {
++        std::printf("hotbarslots: all tests passed\n");
++        return 0;
++    }
++    std::printf("hotbarslots: %d test(s) failed\n", failures);
++    return 1;
++}
